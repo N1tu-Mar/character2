@@ -17,10 +17,12 @@ import json
 import sqlite3
 import tempfile
 import threading
-from pathlib import Path
-
 import unittest
+import uuid
+from pathlib import Path
+from unittest import mock
 
+import relay.core
 from relay import IdempotencyConflict, Relay
 from relay.core import _canonical_json, _digest_text
 
@@ -196,6 +198,32 @@ class SubmitIdempotencyTest(RelayTestCase):
         self.assertEqual(len(rows), 1, "the refused payload gets no row")
         self.assertEqual(rows[0]["id"], accepted)
         self.assertEqual(rows[0]["payload_hash"], payload_hash(payload))
+
+    def test_an_unrelated_integrity_error_is_not_swallowed(self) -> None:
+        """A constraint failure we are not resolving must reach the caller.
+
+        `submit` treats `IntegrityError` as the answer to "is this key already
+        taken?". It is only entitled to do that when the key really is taken.
+        Here the key is free and the failing constraint is the `id` primary
+        key, so there is no deployment to hand back and nothing to compare —
+        reporting either success or a conflict would be a fabricated answer.
+        """
+        payload = approved_request()
+        collision = uuid.uuid4()
+
+        with mock.patch.object(relay.core.uuid, "uuid4", return_value=collision):
+            self.relay.submit(self.key, payload)
+
+            with self.assertRaises(sqlite3.IntegrityError) as caught:
+                self.relay.submit("a-different-key", payload)
+
+        self.assertIn("deployments.id", str(caught.exception))
+        self.assertEqual(
+            len(self.rows_for("a-different-key")),
+            0,
+            "the refused submit leaves no row behind",
+        )
+        self.assertEqual([], self.relay.provider.list_objects())
 
     # ROADMAP 4.13 — the racing path must reach 4.12's verdict.
     def test_concurrent_conflicting_submissions_leave_one_winner(self) -> None:

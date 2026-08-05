@@ -1,5 +1,11 @@
 # ROADMAP — deployments an operator can trust
 
+> **Note on ids.** `CH` is short for **change**. `CH1`, `CH2`, `CH5b` … are the
+> planned changes in §5. They are deliberately *not* `c1`–`c11`, which are the
+> case ids recorded in `fixtures/deployment_events.jsonl`. `F*` are observed
+> facts (§1), `I*` interpretations (§1), `G*` cause groups (§2), and `M*`
+> mutation tests (§7).
+
 Design kept small enough for the 2-hour target. `FakeHubSpot` is treated as an
 external provider and is not modified; all coordination is added around it.
 

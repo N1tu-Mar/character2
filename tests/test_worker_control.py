@@ -50,8 +50,9 @@ WORKERS = 20
 # Deadlock guard only. Ordering comes from the events, never from this number.
 JOIN_TIMEOUT_SECONDS = 30
 
-# The one piece of schema this file names, from ROADMAP CH4.
+# The only pieces of schema this file names, both from ROADMAP CH4.
 LEASE_COLUMN = "lease_expires_at"
+OWNER_COLUMN = "owner"
 
 
 def approved_request() -> dict:
@@ -181,7 +182,18 @@ class WorkerTestCase(unittest.TestCase):
             outcome.error = result.error
 
         thread = threading.Thread(target=run, daemon=True)
-        self.addCleanup(release.set)
+
+        def release_and_join() -> None:
+            """Never leave a parked worker running past the test.
+
+            Releasing without joining lets the worker keep reading and writing
+            files while the temporary directory is being removed, which shows
+            up as an unrelated error in whichever test happens to be running.
+            """
+            release.set()
+            thread.join(JOIN_TIMEOUT_SECONDS)
+
+        self.addCleanup(release_and_join)
         thread.start()
         self.assertTrue(
             reached.wait(JOIN_TIMEOUT_SECONDS),
@@ -198,6 +210,26 @@ class WorkerTestCase(unittest.TestCase):
         release.set()
         thread.join(JOIN_TIMEOUT_SECONDS)
         self.assertFalse(thread.is_alive(), "the released worker never returned")
+
+    def lease_holder(self) -> str | None:
+        """Who the database says owns this run, if anyone."""
+        connection = sqlite3.connect(self.db_path)
+        with contextlib.closing(connection):
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(deployments)")
+            }
+            if OWNER_COLUMN not in columns:
+                raise AssertionError(
+                    f"deployments has no {OWNER_COLUMN} column (CH4): with"
+                    " nothing recording who is executing a run, every worker"
+                    " is entitled to execute all of them"
+                )
+            row = connection.execute(
+                f"SELECT {OWNER_COLUMN} FROM deployments WHERE id = ?",
+                (self.run_id,),
+            ).fetchone()
+        return row[0]
 
     def expire_the_lease(self) -> None:
         """Make the current owner's lease look expired, without waiting.
@@ -332,25 +364,20 @@ class WorkerClaimTest(WorkerTestCase):
             "the owner deploys the approved set, once",
         )
 
-    def test_a_dead_workers_run_is_not_taken_before_its_lease_lapses(
+    def test_a_hung_workers_run_is_not_taken_before_its_lease_lapses(
         self,
     ) -> None:
-        """A crash is not an invitation.
+        """Hung is the case the lease exists for.
 
-        The crashed worker is indistinguishable from a slow one at the moment
-        it stops answering, so ownership has to be released by the lease
-        lapsing rather than by anyone deciding the run looks stuck.
+        A worker that stops answering is indistinguishable from one that is
+        merely slow, so ownership cannot be released by anyone deciding the
+        run looks stuck. Only the lease lapsing releases it.
+
+        A worker that exits through an exception it can report is a different
+        case and is covered separately below -- it lets go on the way out,
+        because it still can.
         """
-        with self.assertRaises(InjectedCrash):
-            self.relay.run_once(
-                self.run_id,
-                crash_at="after_first_provider_write",
-            )
-        self.assertEqual(
-            len(self.held_objects()),
-            1,
-            "precondition: the crash left one confirmed write behind",
-        )
+        _thread, _outcome, _release = self.stalled_worker()
 
         intruder = attempt(self.another_worker(), self.run_id)
 
@@ -362,20 +389,53 @@ class WorkerClaimTest(WorkerTestCase):
         self.assertEqual(stranded["status"], "running")
         self.assertIsNone(stranded["receipt"])
         self.assertEqual(len(self.held_objects()), 1)
+        self.assertIsNotNone(
+            self.lease_holder(),
+            "a run being executed right now is owned, on the record",
+        )
 
-    def test_an_expired_lease_is_reclaimed_and_the_run_finishes(self) -> None:
-        """The other half of CH4: ownership must also be releasable.
+    def test_a_reported_crash_lets_go_of_the_claim_immediately(self) -> None:
+        """The deliberate other half of the rule above.
 
-        A claim that never lapses turns one dead worker into a permanently
-        stranded deployment -- the operator's "stuck" run from c4. Recovery is
-        the production path that picks these up, so the reclaim is driven
-        through `recover()` rather than through anything test-only.
+        `crash_at` raises through `run_once`; the process is still alive and
+        the worker knows it is not continuing. Holding the run for the rest of
+        the lease would strand it for no reason, so a failure a worker can
+        report is a claim it releases. Only a worker that cannot report --
+        killed, hung -- leaves the lease to do the work.
         """
         with self.assertRaises(InjectedCrash):
             self.relay.run_once(
                 self.run_id,
                 crash_at="after_first_provider_write",
             )
+
+        self.assertIsNone(
+            self.lease_holder(),
+            "a worker that reported its own failure must not still own the run",
+        )
+        self.assertEqual(self.state()["status"], "running", "work is unfinished")
+
+        self.another_worker().recover()
+
+        self.assertEqual(
+            self.state()["status"],
+            "done",
+            "the released run is picked up on the next pass, with no waiting",
+        )
+        self.assertEqual(len(self.held_objects()), len(self.payload["assets"]))
+
+    def test_an_expired_lease_is_reclaimed_and_the_run_finishes(self) -> None:
+        """The other half of CH4: ownership must also be releasable.
+
+        A claim that never lapses turns one hung worker into a permanently
+        stranded deployment -- the operator's "stuck" run from c4. Recovery is
+        the production path that picks these up, so the reclaim is driven
+        through `recover()` rather than through anything test-only.
+
+        The hung worker is then released, and must not be able to record an
+        outcome over the run it no longer owns.
+        """
+        thread, stale, release = self.stalled_worker()
 
         self.expire_the_lease()
         self.another_worker().recover()
@@ -392,6 +452,26 @@ class WorkerClaimTest(WorkerTestCase):
             len(self.payload["assets"]),
             "the reclaiming worker lands on the same objects; a reclaim is not"
             " a second deployment",
+        )
+        reclaimed_receipt = reclaimed["receipt"]
+
+        self.finish(thread, release)
+
+        self.assertFalse(
+            stale.completed,
+            "the worker whose lease lapsed must not finish the run it lost;"
+            f" it {stale.describe()}",
+        )
+        self.assertEqual(
+            self.state()["receipt"],
+            reclaimed_receipt,
+            "a stale worker must not write its own receipt over the one the"
+            " owner recorded",
+        )
+        self.assertEqual(
+            len(self.held_objects()),
+            len(self.payload["assets"]),
+            "and it must not go on writing to HubSpot either",
         )
 
 

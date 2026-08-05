@@ -35,6 +35,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Callable
@@ -210,6 +211,29 @@ class WorkerTestCase(unittest.TestCase):
         release.set()
         thread.join(JOIN_TIMEOUT_SECONDS)
         self.assertFalse(thread.is_alive(), "the released worker never returned")
+
+    def lease_deadline(self) -> float | None:
+        """When the current owner's claim lapses, as the database has it.
+
+        Returned as seconds since the epoch so a test can ask the one question
+        that matters -- is this claim still live? -- without knowing anything
+        else about how a lease is stored.
+        """
+        connection = sqlite3.connect(self.db_path)
+        with contextlib.closing(connection):
+            row = connection.execute(
+                f"SELECT {LEASE_COLUMN} FROM deployments WHERE id = ?",
+                (self.run_id,),
+            ).fetchone()
+        if row[0] is None:
+            return None
+        self.assertIsInstance(
+            row[0],
+            (int, float),
+            f"this test reads {LEASE_COLUMN} as a deadline it can compare"
+            " against the clock",
+        )
+        return float(row[0])
 
     def lease_holder(self) -> str | None:
         """Who the database says owns this run, if anyone."""
@@ -423,6 +447,100 @@ class WorkerClaimTest(WorkerTestCase):
             "the released run is picked up on the next pass, with no waiting",
         )
         self.assertEqual(len(self.held_objects()), len(self.payload["assets"]))
+
+    def test_a_working_run_renews_its_lease_and_cannot_be_stolen(self) -> None:
+        """A lease is for a worker that stopped, not for one that is slow.
+
+        A deployment with many assets, or a provider having a bad day, can
+        take longer than one lease. If the claim only ever lapses on a clock,
+        that run is taken away from a worker that is visibly still working --
+        and then two workers write the same deployment, which is the fault
+        this whole mechanism exists to remove.
+
+        So the lease is extended by progress: every ownership check the worker
+        already makes before a write also pushes the deadline out. No timer,
+        no background thread, and nothing to renew once the worker stops.
+
+        Driven by parking the worker between writes and expiring its lease
+        underneath it, so the renewal is observed rather than waited for.
+        """
+        reached = [threading.Event() for _ in self.payload["assets"]]
+        released = [threading.Event() for _ in self.payload["assets"]]
+        outcome = Outcome()
+
+        def park(count: int, _external_key: str) -> None:
+            reached[count - 1].set()
+            if not released[count - 1].wait(JOIN_TIMEOUT_SECONDS):
+                raise AssertionError("the parked worker was never released")
+
+        worker = self.another_worker()
+        worker.provider = ProviderHook(worker.provider, after_write=park)
+
+        def run() -> None:
+            result = attempt(worker, self.run_id)
+            outcome.receipt = result.receipt
+            outcome.error = result.error
+
+        thread = threading.Thread(target=run, daemon=True)
+
+        def release_everything() -> None:
+            for event in released:
+                event.set()
+            thread.join(JOIN_TIMEOUT_SECONDS)
+
+        self.addCleanup(release_everything)
+        thread.start()
+
+        self.assertTrue(
+            reached[0].wait(JOIN_TIMEOUT_SECONDS),
+            "precondition: the worker confirmed its first write",
+        )
+        self.expire_the_lease()
+        self.assertLessEqual(
+            self.lease_deadline() or 0.0,
+            time.time(),
+            "precondition: the original lease has lapsed while it works",
+        )
+
+        released[0].set()
+        self.assertTrue(
+            reached[1].wait(JOIN_TIMEOUT_SECONDS),
+            "the worker carries on with the deployment it still owns",
+        )
+
+        self.assertGreater(
+            self.lease_deadline() or 0.0,
+            time.time(),
+            "a worker that is still writing must extend its own claim; a lease"
+            " that only ever lapses hands a live run to a second worker",
+        )
+        self.assertEqual(
+            self.lease_holder(),
+            worker.worker_id,
+            "and it is still the same worker holding it",
+        )
+
+        intruder = attempt(self.another_worker(), self.run_id)
+        self.assertFalse(
+            intruder.completed,
+            "the renewed lease keeps the run out of anyone else's hands;"
+            f" the intruder {intruder.describe()}",
+        )
+
+        for event in released:
+            event.set()
+        thread.join(JOIN_TIMEOUT_SECONDS)
+
+        self.assertTrue(
+            outcome.completed,
+            f"the owner finishes its own long run; it {outcome.describe()}",
+        )
+        self.assertEqual(self.state()["status"], "done")
+        self.assertEqual(
+            len(self.held_objects()),
+            len(self.payload["assets"]),
+            "one worker, one set of drafts",
+        )
 
     def test_an_expired_lease_is_reclaimed_and_the_run_finishes(self) -> None:
         """The other half of CH4: ownership must also be releasable.

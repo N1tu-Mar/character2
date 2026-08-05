@@ -103,7 +103,7 @@ class Relay:
                 """
                 CREATE TABLE IF NOT EXISTS deployments (
                     id TEXT PRIMARY KEY,
-                    idempotency_key TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
                     payload_hash TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -113,20 +113,55 @@ class Relay:
             )
 
     def submit(self, idempotency_key: str, payload: dict[str, Any]) -> str:
-        """Starter behavior: incorrectly creates a new deployment every time."""
+        """Create the deployment for this approval, or return the existing one.
+
+        The operator's idempotency key is the unit of idempotency, so one key
+        names one deployment. Re-submitting the same approval returns the run
+        that already exists; submitting different content under a key that is
+        already spoken for is refused before anything reaches the provider.
+
+        The `UNIQUE` constraint decides, not a prior `SELECT`. Two workers
+        submitting the same key at once would both see no row and both insert,
+        so the loser's `IntegrityError` is the answer rather than an error --
+        it re-reads the row that actually landed and compares against that.
+        """
         run_id = str(uuid.uuid4())
         payload_json = _canonical_json(payload)
         payload_hash = _digest_text(payload_json)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO deployments
-                    (id, idempotency_key, payload_hash, payload_json, status)
-                VALUES (?, ?, ?, ?, 'pending')
-                """,
-                (run_id, idempotency_key, payload_hash, payload_json),
-            )
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO deployments
+                        (id, idempotency_key, payload_hash, payload_json,
+                         status)
+                    VALUES (?, ?, ?, ?, 'pending')
+                    """,
+                    (run_id, idempotency_key, payload_hash, payload_json),
+                )
+        except sqlite3.IntegrityError:
+            existing = self._deployment_for_key(idempotency_key)
+            if existing is None:
+                # The key is free, so the constraint that failed was not the
+                # one we are resolving. Do not guess at it.
+                raise
+            if str(existing["payload_hash"]) != payload_hash:
+                raise IdempotencyConflict(
+                    f"idempotency key {idempotency_key!r} was already used"
+                    " for a different approved request"
+                ) from None
+            return str(existing["id"])
         return run_id
+
+    def _deployment_for_key(self, idempotency_key: str) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT id, payload_hash FROM deployments
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
 
     def get(self, run_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -154,27 +189,24 @@ class Relay:
     def retry(self, run_id: str) -> str:
         """The admin panel's retry button for a deployment operators call stuck.
 
-        Starter behavior: re-runs the same approved request under a fresh
-        deployment, keeping the operator's original idempotency key.
+        Requeues the deployment the operator is looking at. It does not create
+        a second one: an approval already has a deployment, and minting another
+        under the same key is what put duplicate drafts in HubSpot.
+
+        The stored receipt is dropped, because a requeued run has not completed
+        and must not go on presenting a finished run's receipt as its own.
         """
-        previous = self.get(run_id)
-        new_run_id = str(uuid.uuid4())
-        payload_json = _canonical_json(previous["payload"])
+        self.get(run_id)
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO deployments
-                    (id, idempotency_key, payload_hash, payload_json, status)
-                VALUES (?, ?, ?, ?, 'pending')
+                UPDATE deployments
+                SET status = 'pending', receipt_json = NULL
+                WHERE id = ?
                 """,
-                (
-                    new_run_id,
-                    str(previous["idempotency_key"]),
-                    str(previous["payload_hash"]),
-                    payload_json,
-                ),
+                (run_id,),
             )
-        return new_run_id
+        return run_id
 
     def run_once(
         self,

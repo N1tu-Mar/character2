@@ -20,12 +20,72 @@ class RunCancelled(RuntimeError):
     pass
 
 
+class InvalidApprovedRequest(ValueError):
+    """An approved request that cannot name a deployment or its objects."""
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _digest_text(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def external_key(idempotency_key: str, asset_id: str) -> str:
+    """The only place a provider key is built.
+
+    Identity is the operator's approval, never the attempt that carried it
+    out. The key contains no `run_id`, no UUID, and no timestamp, so a retry,
+    a recovery pass, and a re-submitted approval all compute the same value
+    and land on the same HubSpot object.
+
+    The leading length pins where the idempotency key ends, which makes the
+    encoding injective for any component contents, colons included. Plain
+    concatenation is not: `("a", "b:c")` and `("a:b", "c")` both flatten to
+    `a:b:c`, and two unrelated deployments would share provider objects.
+
+    Neither `payload_hash` nor `display_name` is an input. A hash in the key
+    would move identity with the serialization of a payload; a name in the
+    key would make two legitimately identical names into one object.
+    """
+    return f"{len(idempotency_key)}:{idempotency_key}:{asset_id}"
+
+
+def deployment_namespace(idempotency_key: str) -> str:
+    """The prefix holding exactly one deployment's provider objects.
+
+    Unambiguous for the same reason `external_key` is: scanning for
+    `9:deploy-20:` cannot match `11:deploy-207a:asset-lp-001`, which naive
+    prefix matching on `deploy-20` would.
+    """
+    return f"{len(idempotency_key)}:{idempotency_key}:"
+
+
+def _validate_approved_request(
+    idempotency_key: str,
+    payload: dict[str, Any],
+) -> None:
+    """Refuse a request that cannot name a deployment or its objects."""
+    if not idempotency_key:
+        raise InvalidApprovedRequest(
+            "an approved request needs an idempotency key: it is what names"
+            " the deployment and every object in it"
+        )
+
+    assets = payload.get("assets") or []
+    if not assets:
+        raise InvalidApprovedRequest(
+            "an approved request with no assets is not a deployment"
+        )
+
+    for asset in assets:
+        if not str(asset.get("asset_id") or ""):
+            raise InvalidApprovedRequest(
+                "every approved asset needs an asset id: an empty one makes"
+                f" its provider key equal to {deployment_namespace(idempotency_key)!r},"
+                " which is the namespace the scan for extras runs over"
+            )
 
 
 class FakeHubSpot:
@@ -124,7 +184,11 @@ class Relay:
         submitting the same key at once would both see no row and both insert,
         so the loser's `IntegrityError` is the answer rather than an error --
         it re-reads the row that actually landed and compares against that.
+
+        A request that cannot name a deployment or its objects is refused
+        here, before a row exists and long before the provider is opened.
         """
+        _validate_approved_request(idempotency_key, payload)
         run_id = str(uuid.uuid4())
         payload_json = _canonical_json(payload)
         payload_hash = _digest_text(payload_json)
@@ -222,17 +286,18 @@ class Relay:
             )
 
         readbacks: list[dict[str, str]] = []
+        idempotency_key = str(run["idempotency_key"])
         for index, asset in enumerate(run["payload"]["assets"]):
-            external_key = f"{run_id}:{asset['asset_id']}"
+            object_key = external_key(idempotency_key, str(asset["asset_id"]))
             self.provider.create_draft(
-                external_key=external_key,
+                external_key=object_key,
                 asset=asset,
             )
             if crash_at == "after_first_provider_write" and index == 0:
                 raise InjectedCrash(
                     "crashed after provider write and before local receipt"
                 )
-            readbacks.append(self.provider.read(external_key))
+            readbacks.append(self.provider.read(object_key))
 
         receipt = {
             "run_id": run_id,

@@ -169,10 +169,18 @@ how a deployment is carried out or simulated.
 ## 3. Operator promise
 
 > **A deployment reported as `complete` has just been read back from HubSpot,
-> object by object, and every approved asset was found, matching what was
-> approved, as a draft. If we could not confirm that, we say `divergent` and name
-> what differs. If we could not read HubSpot at all, we say `unknown` and do not
-> guess.**
+> object by object, and every approved asset was found as a draft carrying the
+> identity and provenance fields we sent. If we could not confirm that, we say
+> `divergent` and name what differs. If we could not read HubSpot at all, we say
+> `unknown` and do not guess.**
+>
+> **That is a claim about identity and presence, not about content.** The
+> provider exposes `create_draft`, `read`, and `list_objects` and nothing that
+> returns the rendered body of a landing page or an email. `source_sha256` is a
+> provenance tag we sent and the provider echoed back verbatim (`core.py:67`,
+> F13). Comparing it proves the draft in front of us is the one we wrote for that
+> approved asset. It does not prove HubSpot's stored content hashes to that
+> value, and no method on this provider could establish that.
 >
 > **A run finishing is history, not proof.** `done` means the run completed its
 > work at the time it ran. It is never presented on its own as evidence that
@@ -214,19 +222,41 @@ operator saw and could not express. Certification is never written back over
 history, and history is never presented as certification.
 
 `unknown` is deliberately distinct from `divergent`. If the provider cannot be
-read — a torn read, an exception, a half-written state file (F8) — the answer is
-"we do not know," not "it is wrong." Collapsing the two would make a transient
-read failure look like data loss.
+read — a torn read, a half-written state file (F8) — the answer is "we do not
+know," not "it is wrong." Collapsing the two would make a transient read failure
+look like data loss. Not every exception out of the provider means this; a
+successful read that finds nothing is a different answer, and the boundary is
+drawn below.
 
 ### Certification is `complete` only when all of these hold, from a fresh readback
 
 1. **Coverage** — every approved asset has exactly one corresponding provider draft.
 2. **No omissions** — no approved asset is missing.
 3. **No extras** — scanning the provider for objects under this deployment's key namespace yields exactly the approved set, no duplicates and no strangers.
-4. **Identity match**, per object, on the fields that actually identify it: `external_key`, `source_asset_id`, `source_sha256`, `object_type`, and `status == "draft"`.
+4. **Identity and provenance match**, per object, on the fields that actually identify it: `external_key`, `source_asset_id`, `source_sha256`, `object_type`, and `status == "draft"`. These are the fields we sent and the provider echoed; matching them proves presence and provenance, never content (§3).
 5. **Name match, not name uniqueness** — `display_name` equals the **provider-normalized** form of the approved name. Two objects in the same deployment may legitimately carry the same normalized value; that is not a discrepancy and never fails certification. See below.
 6. **Freshness** — the verdict comes from reading the provider now, never from replaying a stored receipt or a stored certification.
 7. **Honesty** — if 1–5 cannot be proved, certification is `divergent` and the specific failures are named. If the provider cannot be read, certification is `unknown`.
+
+### Missing is not unreadable
+
+Both arrive as exceptions out of the same readback, and they mean opposite
+things. The distinction is a rule, not an implementation detail:
+
+| Provider behavior | Meaning | Certification |
+|---|---|---|
+| `read(key)` raises `KeyError` — the object is absent from a state file that parsed fine | We looked, and it is not there | **`divergent`**, naming the missing `external_key` |
+| `list_objects()` / `read()` raises `JSONDecodeError`, `OSError`, or any failure to parse or open the state at all | We could not look | **`unknown`** |
+
+`KeyError` is a successful read with a negative answer. Mapping it to `unknown`
+would turn a real deletion — the operator's "once there were fewer" — into "we
+do not know," which is precisely the confusion `unknown` exists to prevent.
+Mapping `JSONDecodeError` to `divergent` would report a torn read (F8) as data
+loss. Both directions are pinned by mutations (M11, M11b).
+
+A single readback may produce both: some keys absent, the file readable. That
+certifies `divergent`. `unknown` requires that the provider state could not be
+read at all, so no per-object claim is possible.
 
 ### Rules at the door and at completion
 
@@ -235,12 +265,60 @@ read failure look like data loss.
 10. **Empty request** — an approved request with zero assets is **rejected at `submit`** and never becomes a run. A deployment of nothing is not a deployment, and letting it through is exactly what produces "verified campaign, nothing in HubSpot." Stated as a rule, not a fixture special-case: `len(assets) == 0` is refused for any payload. The alternative — run it and certify `divergent` — is defensible; this roadmap chooses to fail earlier and louder.
 11. **Repeat safety** — same key + same payload returns the existing run and produces no additional provider objects.
 12. **Conflict** — same key + different `payload_hash` raises `IdempotencyConflict` at `submit`, **before any provider write**.
+13. **Concurrent submit resolves through the constraint, not around it.** Rules 11 and 12 cannot be implemented as a `SELECT` followed by an `INSERT` — two workers submitting the same key at once both see no row and both insert. The `UNIQUE` constraint is the arbiter, and the loser's `IntegrityError` is a normal control-flow outcome, not an error to surface:
+
+    - Attempt the `INSERT`. If it succeeds, this submit created the deployment; return the new `run_id`.
+    - On `IntegrityError`, re-read the row that won by `idempotency_key`.
+    - Winner's `payload_hash` equals ours → **return the winner's `run_id`** (rule 11 holds; the caller cannot tell which submit won, and does not need to).
+    - Winner's `payload_hash` differs → raise **`IdempotencyConflict`** (rule 12 holds).
+    - The re-read is mandatory. Deciding from the payload we were handed rather than from the row that actually landed reintroduces the race one layer up.
+
+    This is the same shape as CH4's claim: a conditional write whose outcome is read back from the database, never inferred. Both the sequential path and the racing path must reach the identical verdict, so the acceptance suite exercises both.
 
 ### Identity: what names a HubSpot object
 
-`external_key = idempotency_key + ":" + asset_id`
+Plain concatenation of `idempotency_key + ":" + asset_id` is **ambiguous** and is
+not used. Nothing forbids a colon inside either component, and if one appears the
+mapping stops being injective: key `a` with asset `b:c` and key `a:b` with asset
+`c` both produce `a:b:c`. Two unrelated deployments would then share provider
+objects, and the namespace scan in rule 3 would attribute one deployment's
+objects to another. No fixture triggers this — which is exactly why it has to be
+closed by a rule rather than left to the shapes we happen to have (F11).
 
-That is the whole rule. Two properties follow, and both matter:
+**One shared function, length-prefixed, defined once:**
+
+```
+external_key(idempotency_key, asset_id) = f"{len(idempotency_key)}:{idempotency_key}:{asset_id}"
+deployment_namespace(idempotency_key)   = f"{len(idempotency_key)}:{idempotency_key}:"
+```
+
+The length prefix pins where the key ends, so the encoding is injective for any
+component contents, colons included. `a`/`b:c` gives `1:a:b:c`; `a:b`/`c` gives
+`3:a:b:c`. The namespace prefix is unambiguous for the same reason: scanning for
+`9:deploy-20:` cannot match `11:deploy-207a:asset-lp-001`, which naive prefix
+matching on `deploy-20` would.
+
+Both components are rejected at `submit` if empty, so a namespace prefix can
+never itself be a valid object key.
+
+**Why length-prefixing rather than hashing the pair.** A digest is equally
+collision-safe and would also be injective in practice, but it destroys the
+namespace scan's readability: rule 3 requires enumerating every provider object
+belonging to a deployment, and with opaque keys an operator reading the provider
+state cannot see which deployment owns what. Since the entire point of this work
+is a system an operator can check, a key they can read is worth more than a
+shorter one. If key length ever becomes a provider constraint, hashing the
+length-prefixed string is the drop-in replacement — the injectivity argument
+carries over unchanged.
+
+**This function is the only place a provider key is constructed.** Writing in
+`run_once`, recovery, retry, the certification readback, and the rule 3 namespace
+scan all call it. An `f"..."` built inline anywhere else is a defect, because the
+writer and the certifier disagreeing about a key produces a false `divergent`
+that looks exactly like real data loss. See §5 on why this lands in the first
+implementation slice.
+
+Two properties follow from the inputs, and both matter:
 
 - **Stable across runs.** The key contains nothing that varies per run — no `run_id`, no UUID, no timestamp. A retry, a recovery pass, and a re-submitted approval all compute the same key and land on the same object. This is what removes G2.
 - **`payload_hash` is deliberately excluded.** It guards the door (rule 12) and does not name the object. If it were part of the key, identity would drift with any change in how a payload is serialized — a reordered key, a whitespace change — and the same approval would silently acquire a second set of drafts. Conflicting content is refused before a write, so it never needs to be encoded in the key afterwards.
@@ -267,11 +345,13 @@ Change ids are `CH*` so they cannot be confused with the event-log case ids
 
 | # | Change | Label | Addresses |
 |---|---|---|---|
-| CH1 | Provider `external_key` becomes `idempotency_key:asset_id` instead of `run_id:asset_id`. Retries, recovery, and re-submits land on the same HubSpot objects. `payload_hash` is not part of the key (§4, Identity). | **ROOT CAUSE FIX** | G2 (c2, c4) |
-| CH2 | `UNIQUE` on `idempotency_key`. Same key + same `payload_hash` returns the existing `run_id`; different `payload_hash` raises `IdempotencyConflict` before any provider write. Finally reads the column from F16. | **ROOT CAUSE FIX** | G2, G3 (c2, c5) |
+| CH1 | Provider `external_key` comes from one shared, collision-safe, length-prefixed function over `idempotency_key` and `asset_id`, replacing `run_id:asset_id`. Every writer and every reader calls it; no key is built inline. Retries, recovery, and re-submits land on the same HubSpot objects. `payload_hash` is not part of the key (§4, Identity). | **ROOT CAUSE FIX** | G2 (c2, c4) |
+| CH1b | Reject empty `idempotency_key` and empty `asset_id` at `submit`, so a deployment namespace can never collide with an object key (§4, Identity). | **FALSE-PASS PREVENTION** | §4, Identity |
+| CH2 | `UNIQUE` on `idempotency_key`. Same key + same `payload_hash` returns the existing `run_id`; different `payload_hash` raises `IdempotencyConflict` before any provider write. Insert-first, then resolve `IntegrityError` by re-reading the winning row (§4.13) — never `SELECT`-then-`INSERT`. Finally reads the column from F16. | **ROOT CAUSE FIX** | G2, G3 (c2, c5) |
 | CH3 | Reject zero-asset payloads at `submit`. | **FALSE-PASS PREVENTION** | F12, §4.10 |
 | CH4 | Atomic claim: `owner`, `lease_expires_at`, `attempt` columns; claim via conditional `UPDATE` checked with `rowcount`. Verified — 20 racing threads, exactly 1 winner. Expired leases are reclaimable so a stalled worker does not strand a run. | **ROOT CAUSE FIX** | G4 (c8, c4's stall) |
 | CH5 | Replace the `verified` boolean with a computed **certification** (`complete` / `divergent` / `unknown`) derived from a fresh readback against §4.1–4.5, plus `certified_at` and a `discrepancies` list. Never a literal. | **FALSE-PASS PREVENTION** | G1 (c7, c8) |
+| CH5b | Certification maps a `KeyError` from `read()` to `divergent` and a parse/open failure of the provider state to `unknown` (§4, Missing is not unreadable). The two must not share an `except` clause. | **FALSE-PASS PREVENTION** | G1, F8 |
 | CH6 | Split workflow status from certification (§4). `status` keeps `pending`/`running`/`done`/`cancelled`/`failed` and is historical; certification is recomputed on demand and never stored as truth. A run ends `done` only if it certified `complete` at completion; otherwise `failed`. | **ROOT CAUSE FIX** | G1, and the operator's "I have no way to know what this service promises" |
 | CH7 | `audit` re-reads the provider and recomputes certification, returning it alongside the historical status and the time of the check. `deployment_summary` likewise never presents status alone. | **FALSE-PASS PREVENTION** | G1, §4.9 |
 | CH8 | `cancel` sets `cancel_requested`; `run_once` checks it before every provider write and raises `RunCancelled`; the terminal status update becomes conditional on ownership and non-cancellation. | **ROOT CAUSE FIX** | G5 (c6) |
@@ -289,6 +369,22 @@ the false passes), then CH2, CH1 (duplicates), then CH8, CH4 (cancel and claim),
 then CH9, CH10. CH11–CH12 last. If CH9/CH10 do not land, they move to
 `DECISIONS.md` as known-open, which for G6 is honest anyway given it is the
 least-proven group.
+
+**One exception to that order.** The shared `external_key` function from §4 lands
+in the **first** slice, before CH5, even though CH1's switch to
+`idempotency_key`-derived keys comes later. CH5 makes certification compute an
+expected key and compare it to what the provider holds — so from the moment
+certification exists, the writer and the certifier are two callers that must
+agree. If CH5 ships while `run_once` still builds `f"{run_id}:{asset_id}"`
+inline, the two derive keys independently and any divergence between them
+certifies `divergent` while HubSpot is in fact correct. That is a false failure
+wearing the exact costume of the real one this project exists to detect, and it
+would be indistinguishable in the demo.
+
+So: extract the function first with `run_id` still as its input, then CH1 becomes
+a one-line change to what is passed in, and every caller moves at once. The cost
+is one refactor commit before any behavior changes; the benefit is that writer
+and certifier can never disagree about a key at any point in the sequence.
 
 ---
 
@@ -309,12 +405,19 @@ Rules for every test below:
 | Same key + changed payload → `IdempotencyConflict`, **and the provider is untouched** — assert object count is unchanged after the raise | full, then full with one field altered in-test | both accepted, both would write (F16) |
 | `retry` creates no additional drafts | full | 8 objects (F5) |
 | `external_key` is stable across runs — the key computed for an asset is identical before and after a retry and a recovery, and contains no `run_id` | full | key embeds a fresh UUID (F3) |
+| **Key encoding is injective under colons** — `(key="a", asset="b:c")` and `(key="a:b", asset="c")` produce different `external_key` values, and neither deployment's namespace scan picks up the other's objects. Derived in-test, not from any fixture | derived in-test | plain concatenation collides (§4, Identity) |
+| A namespace scan for a key that is a string prefix of another key returns only its own objects — e.g. `deploy-20` must not match `deploy-207a`'s objects | derived in-test, using c3's key shapes as inspiration rather than its literal values | no namespace scan exists |
+| Empty `idempotency_key` or empty `asset_id` is rejected at `submit` | derived in-test | no such guard (CH1b) |
+| **Both writer and certifier use the same key function** — monkeypatch the shared function to a different valid encoding and assert a full deploy still certifies `complete`. If either side built its key inline, the run certifies `divergent` | full | keys are built inline in `run_once` (F3) |
 | Two approved assets whose names normalize to the same value both deploy and certify `complete` | **full** — `asset-email-002` and `asset-email-003` collide by name (F10) and must both succeed | (passes today by accident; kept as a guard against ever adding a name-uniqueness rule) |
 | A `display_name` past the limit certifies `complete` — normalization is expected, not a discrepancy | full (three names exceed the limit) | nothing compared |
 | Deleting a provider object makes a fresh check certify `divergent` | full | `audit` never opens the provider (F2) |
 | Tampering with `source_asset_id` / `source_sha256` / `object_type` / `status` in provider state certifies `divergent` | full | nothing is compared (F1) |
 | An unexpected object under this deployment's key namespace certifies `divergent` | full + one injected stray object | nothing scans for extras |
-| An unreadable provider certifies `unknown`, not `divergent` and not `complete` | full, via a wrapper that raises on read | no such distinction exists |
+| An unreadable provider certifies `unknown`, not `divergent` and not `complete` | full, via a wrapper that raises `JSONDecodeError` on read | no such distinction exists |
+| **A missing object certifies `divergent`, not `unknown`** — the state file parses cleanly and one key is absent, so `read()` raises `KeyError`. The two exception paths are asserted in the same test so neither can absorb the other | full, one object removed from provider state | both would be untyped failures; nothing reads the provider at all (F2) |
+| Concurrent submits of the same key + same payload: N threads, exactly one row created, **every** thread receives the same `run_id`, and no thread sees an `IntegrityError` escape | full, N threads on one key | `submit` inserts unconditionally (F4) |
+| Concurrent submits of the same key + **different** payloads: exactly one wins, every loser raises `IdempotencyConflict`, and the provider is untouched | full + one field altered in-test | both accepted, both would write (F16) |
 | **Status and certification are independent** — after a successful run, delete an object; workflow status stays `done`, a fresh check certifies `divergent`, and no surface reports `done` without a certification | full | `done` and `verified` are welded together (F2) |
 | A run that finishes writing but cannot certify `complete` ends `failed`, not `done` | full, via a wrapper that drops one write | every run ends `done` (F9) |
 | Cancellation after one write prevents later writes and cannot reach `done` | full | status returns to `done`, all assets written (F6) |
@@ -341,15 +444,21 @@ mutation before applying the next.
 |---|---|---|
 | M1 | In `submit`, delete the lookup by `idempotency_key` and unconditionally `INSERT` a fresh `uuid4` row. | Same key + same payload → second submit returns a *different* run id and provider object count doubles. |
 | M2 | In `submit`, keep the lookup but compare `idempotency_key` only, ignoring `payload_hash` — return the existing run instead of raising. | Same key + changed payload → no `IdempotencyConflict`; the new payload silently inherits the old payload's drafts. |
+| M2b | In `submit`, replace insert-first with `SELECT` then `INSERT`, keeping the same verdict logic. | The concurrent-same-payload check fails — N threads race the gap between the read and the write and create more than one row for one key. Sequential submits still pass, which is the point: only the racing test catches it. |
+| M2c | On `IntegrityError`, raise `IdempotencyConflict` without re-reading the winning row. | The concurrent-same-payload check fails — an identical re-submit is reported as a conflict purely for losing a race. |
+| M2d | On `IntegrityError`, return the winner's `run_id` without comparing `payload_hash`. | The concurrent-different-payload check fails — a genuinely conflicting payload silently inherits the winner's deployment. Together with M2c this pins §4.13 from both sides. |
 | M3 | Move the conflict check to *after* the first `create_draft` call instead of before it. | Same key + changed payload still raises, but the provider object count has changed — the "provider is untouched" half of the check fails. |
 | M4 | Restore `external_key = f"{run_id}:{asset_id}"` in `run_once`. | `retry` produces a second full set of drafts, and the key-stability check sees a different key after recovery. |
 | M5 | Include `payload_hash` in `external_key`, then re-submit the identical approval with its JSON serialized in a different key order. | Key stability fails — semantically identical approvals compute different keys and acquire a second set of drafts. |
+| M5b | Replace the length-prefixed key with plain `f"{idempotency_key}:{asset_id}"`. | The injectivity check fails — `("a", "b:c")` and `("a:b", "c")` collide, and the prefix-scan check attributes one deployment's objects to another. |
+| M5c | Have `run_once` build its `external_key` inline instead of calling the shared function. | The writer/certifier agreement check fails — with the shared function patched, the two sides disagree and a correct deployment certifies `divergent`. |
 | M6 | In the field comparison, assert only that `object_id` is truthy; drop the equality checks on `external_key`, `source_asset_id`, `source_sha256`, `object_type`, `status`. | Tampering with any of those in provider state still certifies `complete`. |
 | M7 | Add `display_name` to the fields that must be **unique** across a deployment (or reject colliding names at `submit`). | The two-assets-sharing-a-normalized-name check fails — a valid approval is rejected or certified `divergent`. **This is the mutation that guards against re-introducing the rule this roadmap deliberately excludes (CH16).** |
 | M8 | Set the expected `display_name` to the raw approved string instead of the normalized form. | A request whose names exceed the limit certifies `divergent` — a false discrepancy. Together with M7, this pins name handling from both sides: too strict on value, too strict on uniqueness. |
 | M9 | In the certification routine, replace the per-key `provider.read()` with `json.loads(row["receipt_json"])["objects"]`. | Deleting a provider object still certifies `complete`. |
 | M10 | Have `audit` return the certification stored on the receipt instead of recomputing it. | The status/certification independence check fails — a stale `complete` survives a real deletion. |
 | M11 | Map an unreadable provider to `divergent` instead of `unknown`. | The unreadable-provider check fails; a transient read failure is reported as data loss. |
+| M11b | Map a `KeyError` from `read()` to `unknown` instead of `divergent` — or catch both exception types in one `except` and return a single verdict. | The missing-object check fails; a real deletion is reported as "we could not look." Pinned in the opposite direction from M11 so no single `except` clause can satisfy both. |
 | M12 | Let `run_once` set `status='done'` regardless of the certification it computed. | The finished-but-uncertifiable run is reported `done` instead of `failed`. |
 | M13 | Have `deployment_summary` return workflow status with no certification field. | The "no surface reports `done` without a certification" assertion fails. |
 | M14a | Remove the `cancel_requested` read from the per-asset loop in `run_once`. | A run cancelled after the first write keeps writing the remaining assets. |
@@ -425,6 +534,7 @@ thing.
 
 For `DECISIONS.md`:
 
+- **Certification proves identity and presence, never content integrity.** The provider returns no rendered body for a landing page or an email, so there is nothing to hash-check against `source_sha256`. That field is a provenance tag we sent and the provider echoed back verbatim (`core.py:67`); comparing it establishes that the draft we found is the one we wrote for that approved asset, and nothing more. If HubSpot stored the right identifiers against the wrong body, this design certifies `complete` and is wrong. Closing that would need a provider method that returns content — the same limitation that makes the starter's `test_every_deployed_object_matches_its_source_asset` tautological (F13). Our version is not tautological, because it compares a fresh readback against the approved payload rather than a value against itself, but it is bounded by the same missing capability.
 - **Certification is point-in-time and expires the instant it is returned.** HubSpot can change a second later. `complete` means "complete when we looked," and the timestamp is reported for exactly that reason. There is no watch, no subscription, and no continuous reconciliation.
 - The provider can still lose writes. We detect it and report `divergent`; we do not prevent it (CH13).
 - `unknown` is honest but not actionable on its own. A run stuck at `unknown` needs a human or a later successful read; nothing here resolves it automatically.

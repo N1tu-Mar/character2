@@ -2,11 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# How long a worker owns a run before another worker may take it over. A
+# worker that dies without letting go blocks the run for this long and no
+# longer; a worker that is merely slow keeps its claim by still holding it.
+LEASE_SECONDS = 30.0
+
+# How many times the automatic path may execute one deployment before it stops
+# and asks for a person. The bound is what makes recovery's per-run isolation
+# safe: without it, a run that can never succeed is retried on every sweep
+# forever, which is c9's head-of-line stall turned into a spin (ROADMAP §4.14).
+MAX_ATTEMPTS = 3
+
+# How many write-then-readback rounds one object gets when the provider fails
+# to answer. Bounded for the same reason: a reconcile loop that never gives up
+# is a worker that never returns.
+RECONCILE_ATTEMPTS = 3
 
 COMPLETE = "complete"
 DIVERGENT = "divergent"
@@ -37,6 +55,15 @@ class RunCancelled(RuntimeError):
     pass
 
 
+class RunNotOwned(RuntimeError):
+    """This worker is not the one entitled to execute or finish this run.
+
+    Raised when a claim is refused because another worker holds a live lease,
+    and when a worker that has lost its claim tries to write or to record an
+    outcome. A run belongs to one worker at a time; everyone else declines.
+    """
+
+
 class InvalidApprovedRequest(ValueError):
     """An approved request that cannot name a deployment or its objects."""
 
@@ -47,6 +74,25 @@ class ProviderUnreadable(RuntimeError):
     Raised only for "we could not look". An object that is absent from a state
     file that parsed fine is a successful read with a negative answer, and is
     never routed through here (ROADMAP §4, Missing is not unreadable).
+    """
+
+
+class ProviderWriteFailed(RuntimeError):
+    """A write we could not confirm, and a readback that did not find it.
+
+    The write was attempted, the provider did not answer, and reading the key
+    back showed nothing there -- repeated up to the bound. This is the honest
+    end of an ambiguous write: we know the object is not in HubSpot, so the
+    deployment cannot be reported as done (ROADMAP CH10).
+    """
+
+
+class ProviderWriteDiverged(RuntimeError):
+    """The key we wrote is held by something that is not what we sent.
+
+    Reconciliation resolves "did my write land?"; it does not get to decide
+    that whatever is sitting on the key will do. A mismatch here means two
+    writers disagree about one object, and that is not ours to paper over.
     """
 
 
@@ -176,6 +222,10 @@ class Relay:
     def __init__(self, db_path: Path, provider_state_path: Path) -> None:
         self.db_path = Path(db_path)
         self.provider = FakeHubSpot(provider_state_path)
+        # One `Relay` is one worker. Operators run several processes against
+        # the same database, so the identity has to survive being written down
+        # and compared by a different process than the one that wrote it.
+        self.worker_id = f"{os.getpid()}:{uuid.uuid4()}"
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -193,10 +243,32 @@ class Relay:
                     payload_hash TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    receipt_json TEXT
+                    receipt_json TEXT,
+                    owner TEXT,
+                    lease_expires_at REAL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
+            # A database written before these columns existed is still a
+            # database an operator is holding runs in. Adding the columns is
+            # cheaper than an error message they cannot act on.
+            present = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(deployments)")
+            }
+            for column, definition in (
+                ("owner", "TEXT"),
+                ("lease_expires_at", "REAL"),
+                ("attempt", "INTEGER NOT NULL DEFAULT 0"),
+                ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in present:
+                    connection.execute(
+                        f"ALTER TABLE deployments ADD COLUMN {column}"
+                        f" {definition}"
+                    )
 
     def submit(self, idempotency_key: str, payload: dict[str, Any]) -> str:
         """Create the deployment for this approval, or return the existing one.
@@ -270,9 +342,23 @@ class Relay:
         return result
 
     def cancel(self, run_id: str) -> None:
+        """Stop a deployment, whether or not a worker is running it.
+
+        `cancel_requested` is the durable half and the one that decides: the
+        worker reads it before every provider write and before it is allowed
+        to record an outcome. Writing a status alone is what made cancellation
+        advisory -- a finishing worker simply wrote over it.
+
+        Objects already in HubSpot stay there. The provider has no delete, so
+        a cancellation means "no further writes", never "as if it never ran".
+        """
         with self._connect() as connection:
             connection.execute(
-                "UPDATE deployments SET status = 'cancelled' WHERE id = ?",
+                """
+                UPDATE deployments
+                SET cancel_requested = 1, status = 'cancelled'
+                WHERE id = ? AND status IN ('pending', 'running')
+                """,
                 (run_id,),
             )
 
@@ -284,19 +370,194 @@ class Relay:
         under the same key is what put duplicate drafts in HubSpot.
 
         The stored receipt is dropped, because a requeued run has not completed
-        and must not go on presenting a finished run's receipt as its own.
+        and must not go on presenting a finished run's receipt as its own. The
+        lease and the attempt count are cleared with it: this is a new,
+        operator-authorized attempt, not a continuation of the exhausted one.
         """
         self.get(run_id)
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE deployments
-                SET status = 'pending', receipt_json = NULL
+                SET status = 'pending',
+                    receipt_json = NULL,
+                    owner = NULL,
+                    lease_expires_at = NULL,
+                    attempt = 0,
+                    cancel_requested = 0
                 WHERE id = ?
                 """,
                 (run_id,),
             )
         return run_id
+
+    # -- ownership ------------------------------------------------------------
+    #
+    # A run is executed by one worker at a time. The claim is a conditional
+    # `UPDATE` and the database decides who won: `rowcount` is the answer, and
+    # nothing is inferred from a prior `SELECT`. Two workers racing one pending
+    # run both issue the same statement; SQLite serializes them, the second
+    # one's `WHERE` no longer matches, and it updates no rows.
+
+    def _ownership_row(self, run_id: str) -> sqlite3.Row:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT status, owner, lease_expires_at, cancel_requested
+                FROM deployments WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return row
+
+    def _claim(self, run_id: str) -> None:
+        """Take ownership of a run, or explain why this worker may not.
+
+        Claimable when the run is waiting or already ours, has not been
+        cancelled, and is either unowned or held under a lease that has
+        lapsed. A lapsed lease is the only way a run leaves a worker that
+        never came back -- which is indistinguishable, from here, from a
+        worker that is merely slow.
+        """
+        now = time.time()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'running',
+                    owner = ?,
+                    lease_expires_at = ?,
+                    attempt = attempt + 1
+                WHERE id = ?
+                  AND cancel_requested = 0
+                  AND status IN ('pending', 'running')
+                  AND (
+                        owner IS NULL
+                     OR owner = ?
+                     OR lease_expires_at IS NULL
+                     OR lease_expires_at <= ?
+                  )
+                """,
+                (
+                    self.worker_id,
+                    now + LEASE_SECONDS,
+                    run_id,
+                    self.worker_id,
+                    now,
+                ),
+            )
+            claimed = cursor.rowcount == 1
+        if claimed:
+            return
+
+        # The claim failed. Read the row to say why -- the verdict is still the
+        # `rowcount` above, this only turns it into a message.
+        row = self._ownership_row(run_id)
+        if int(row["cancel_requested"]):
+            raise RunCancelled(
+                f"deployment {run_id} was cancelled and will not be executed"
+            )
+        if str(row["status"]) not in ("pending", "running"):
+            raise RunNotOwned(
+                f"deployment {run_id} is {row['status']!r} and is not waiting"
+                " to be executed"
+            )
+        raise RunNotOwned(
+            f"deployment {run_id} is owned by {row['owner']!r} under a lease"
+            " that has not lapsed"
+        )
+
+    def _require_still_ours(self, run_id: str) -> None:
+        """Checked before every provider write and before any outcome.
+
+        Ownership and cancellation are both read again here rather than
+        remembered from the claim, because both can change underneath a run
+        that is in the middle of writing.
+
+        The same statement renews the lease. A lease is meant to release a run
+        from a worker that stopped, not from one that is slow: a deployment
+        with many assets, or a provider having a bad day, can outlast one
+        lease while visibly making progress, and taking that run away would
+        put two workers on it -- the fault this mechanism exists to remove.
+
+        Renewal is driven by progress rather than by a timer, so there is no
+        background thread to keep a dead worker's claim alive. A worker that
+        stops making progress stops renewing, and its lease lapses on its own.
+        """
+        deadline = time.time() + LEASE_SECONDS
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET lease_expires_at = ?
+                WHERE id = ?
+                  AND owner = ?
+                  AND cancel_requested = 0
+                  AND status = 'running'
+                """,
+                (deadline, run_id, self.worker_id),
+            )
+            if cursor.rowcount == 1:
+                return
+
+        # The conditional write said no. Read the row to say why.
+        row = self._ownership_row(run_id)
+        if int(row["cancel_requested"]) or str(row["status"]) == "cancelled":
+            raise RunCancelled(
+                f"deployment {run_id} was cancelled while it was running"
+            )
+        if str(row["owner"] or "") != self.worker_id:
+            raise RunNotOwned(
+                f"deployment {run_id} is no longer owned by this worker"
+                f" (now {row['owner']!r})"
+            )
+        raise RunNotOwned(
+            f"deployment {run_id} is {row['status']!r} and is no longer this"
+            " worker's to carry on with"
+        )
+
+    def _release(self, run_id: str) -> None:
+        """Let go of a claim without recording an outcome.
+
+        Called when a run exits through an exception it could report. A worker
+        that is killed outright cannot run this, which is exactly what the
+        lease is for.
+        """
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE deployments
+                SET owner = NULL, lease_expires_at = NULL
+                WHERE id = ? AND owner = ?
+                """,
+                (run_id, self.worker_id),
+            )
+
+    def _finish(self, run_id: str, status: str, receipt: dict[str, Any]) -> bool:
+        """Record a terminal outcome, if this worker is still entitled to.
+
+        Conditional on ownership and on the absence of a cancellation, so a
+        stale worker and a cancelled run cannot be written over with `done`.
+        `rowcount` decides; the caller is told whether the write landed.
+        """
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = ?,
+                    receipt_json = ?,
+                    owner = NULL,
+                    lease_expires_at = NULL
+                WHERE id = ?
+                  AND owner = ?
+                  AND cancel_requested = 0
+                  AND status = 'running'
+                """,
+                (status, _canonical_json(receipt), run_id, self.worker_id),
+            )
+            return cursor.rowcount == 1
 
     # -- certification --------------------------------------------------------
     #
@@ -320,6 +581,30 @@ class Relay:
         )
         return str(value).strip()[:limit]
 
+    def _expected_object(
+        self,
+        idempotency_key: str,
+        asset: dict[str, Any],
+    ) -> dict[str, str]:
+        """What one approved asset must look like in the provider.
+
+        One definition, used by certification and by the reconciliation of an
+        unanswered write. If those two disagreed about what a correct object
+        looks like, a reconciled write would certify `divergent` immediately
+        afterwards.
+        """
+        key = external_key(idempotency_key, str(asset["asset_id"]))
+        return {
+            "external_key": key,
+            "source_asset_id": str(asset["asset_id"]),
+            "source_sha256": str(asset["source_sha256"]),
+            "object_type": str(asset["type"]),
+            "display_name": self._normalized_display_name(
+                asset["display_name"]
+            ),
+            "status": "draft",
+        }
+
     def _expected_objects(
         self,
         idempotency_key: str,
@@ -328,17 +613,8 @@ class Relay:
         """What the provider must be holding for this approval, per §4.4-4.5."""
         expected: dict[str, dict[str, str]] = {}
         for asset in payload.get("assets", []):
-            key = external_key(idempotency_key, str(asset["asset_id"]))
-            expected[key] = {
-                "external_key": key,
-                "source_asset_id": str(asset["asset_id"]),
-                "source_sha256": str(asset["source_sha256"]),
-                "object_type": str(asset["type"]),
-                "display_name": self._normalized_display_name(
-                    asset["display_name"]
-                ),
-                "status": "draft",
-            }
+            want = self._expected_object(idempotency_key, asset)
+            expected[want["external_key"]] = want
         return expected
 
     def _list_provider_objects(self) -> list[dict[str, str]]:
@@ -462,6 +738,93 @@ class Relay:
         verdict, _found = self._certify(self.get(run_id))
         return verdict
 
+    # -- writing --------------------------------------------------------------
+
+    def _write_draft(
+        self,
+        idempotency_key: str,
+        asset: dict[str, Any],
+    ) -> dict[str, str]:
+        """Create one draft, and resolve an unanswered write by looking.
+
+        A provider that raises has told us nothing about HubSpot. The write may
+        have landed and the acknowledgement been lost -- c10's
+        `gateway_timeout, retryable: true`, with the object right there on a
+        readback -- or it may never have landed at all. The two are identical
+        from here, so the exception is a question and the provider holds the
+        answer (ROADMAP CH10, G7).
+
+        Found and matching is a success: the provider is idempotent and the key
+        is derived from the approval, not from the attempt, so the object we
+        find is the object we meant to write. Absent means try again, up to
+        `RECONCILE_ATTEMPTS` -- bounded, because a reconcile loop that never
+        gives up is the stall this project exists to remove. Present but
+        different is not ours to resolve and is raised.
+        """
+        want = self._expected_object(idempotency_key, asset)
+        object_key = want["external_key"]
+        unanswered: BaseException | None = None
+
+        for _round in range(RECONCILE_ATTEMPTS):
+            try:
+                return dict(
+                    self.provider.create_draft(
+                        external_key=object_key,
+                        asset=asset,
+                    )
+                )
+            except IdempotencyConflict:
+                # The provider answered, and its answer is that this key is
+                # held by different content. Nothing ambiguous to resolve.
+                raise
+            except Exception as error:  # noqa: BLE001 - resolved by readback
+                unanswered = error
+
+            stored = self._read_provider_object(object_key)
+            if stored is None:
+                # We looked, and the write is not there. Another round.
+                continue
+            if all(
+                str(stored.get(field)) == want[field]
+                for field in IDENTITY_FIELDS
+            ):
+                return stored
+            raise ProviderWriteDiverged(
+                f"provider key {object_key!r} holds something other than the"
+                f" approved asset {want['source_asset_id']!r}"
+            ) from unanswered
+
+        raise ProviderWriteFailed(
+            f"{RECONCILE_ATTEMPTS} attempts to write {object_key!r} were not"
+            " confirmed, and reading it back did not find it"
+        ) from unanswered
+
+    def _fail(self, run_id: str, reason: str) -> bool:
+        """End a run at `failed`, naming what stopped it.
+
+        Conditional on the run still being `running` and not cancelled, for the
+        same reason `_finish` is: a worker that has lost the run does not get
+        to write its outcome. No receipt of deployed objects is stored -- the
+        run has none to show -- only what an operator needs to decide whether
+        to press retry (§4.14).
+        """
+        note = {"run_id": run_id, "outcome": "failed", "reason": reason}
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE deployments
+                SET status = 'failed',
+                    receipt_json = ?,
+                    owner = NULL,
+                    lease_expires_at = NULL
+                WHERE id = ?
+                  AND status = 'running'
+                  AND cancel_requested = 0
+                """,
+                (_canonical_json(note), run_id),
+            )
+            return cursor.rowcount == 1
+
     def run_once(
         self,
         run_id: str,
@@ -469,45 +832,58 @@ class Relay:
         crash_at: str | None = None,
     ) -> dict[str, Any]:
         run = self.get(run_id)
-        with self._connect() as connection:
-            connection.execute(
-                "UPDATE deployments SET status = 'running' WHERE id = ?",
-                (run_id,),
-            )
+        self._claim(run_id)
 
-        idempotency_key = str(run["idempotency_key"])
-        for index, asset in enumerate(run["payload"]["assets"]):
-            object_key = external_key(idempotency_key, str(asset["asset_id"]))
-            self.provider.create_draft(
-                external_key=object_key,
-                asset=asset,
-            )
-            if crash_at == "after_first_provider_write" and index == 0:
-                raise InjectedCrash(
-                    "crashed after provider write and before local receipt"
+        try:
+            idempotency_key = str(run["idempotency_key"])
+            for index, asset in enumerate(run["payload"]["assets"]):
+                # Before every write, not once at the start: a cancellation
+                # that lands between two writes has to stop the second one,
+                # and a run taken over by another worker must stop writing on
+                # its behalf.
+                self._require_still_ours(run_id)
+                try:
+                    self._write_draft(idempotency_key, asset)
+                except (ProviderWriteFailed, ProviderWriteDiverged) as error:
+                    # The provider was asked, and answered. This deployment is
+                    # over, and it says so where an operator can see it rather
+                    # than leaving the row `running` for a worker that has
+                    # already stopped (§4.8).
+                    self._fail(run_id, f"{type(error).__name__}: {error}")
+                    raise
+                if crash_at == "after_first_provider_write" and index == 0:
+                    raise InjectedCrash(
+                        "crashed after provider write and before local receipt"
+                    )
+
+            # `done` is earned, not assumed (ROADMAP §4.8). The run has
+            # finished every write it was asked to make; whether it may say so
+            # depends on what the provider holds when it is read now, after
+            # the last write.
+            self._require_still_ours(run_id)
+            verdict, objects = self._certify(run)
+            status = "done" if verdict["certification"] == COMPLETE else "failed"
+            receipt = {
+                "run_id": run_id,
+                "payload_sha256": run["payload_hash"],
+                "objects": objects,
+                "certification_at_completion": verdict,
+            }
+            if not self._finish(run_id, status, receipt):
+                # The conditional write is the authority. Something changed
+                # between the last check and this one, and whatever it was,
+                # this outcome is not ours to record.
+                self._require_still_ours(run_id)
+                raise RunNotOwned(
+                    f"deployment {run_id} would not accept an outcome from"
+                    " this worker"
                 )
-
-        # `done` is earned, not assumed (ROADMAP §4.8). The run has finished
-        # every write it was asked to make; whether it may say so depends on
-        # what the provider holds when it is read now, after the last write.
-        verdict, objects = self._certify(run)
-        status = "done" if verdict["certification"] == COMPLETE else "failed"
-        receipt = {
-            "run_id": run_id,
-            "payload_sha256": run["payload_hash"],
-            "objects": objects,
-            "certification_at_completion": verdict,
-        }
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE deployments
-                SET status = ?, receipt_json = ?
-                WHERE id = ?
-                """,
-                (status, _canonical_json(receipt), run_id),
-            )
-        return receipt
+            return receipt
+        except BaseException:
+            # A failure this worker can still report is a failure it can let
+            # go of. A worker that is killed cannot, and the lease covers it.
+            self._release(run_id)
+            raise
 
     def deployment_summary(self, run_id: str) -> dict[str, Any]:
         """Operator-facing summary of what a deployment did.
@@ -560,14 +936,64 @@ class Relay:
         }
 
     def recover(self) -> None:
-        """
-        Starter behavior: enough recovery for the happy-path demo.
+        """Pick up runs that no live worker is holding.
 
-        Operator evidence reports other cases that this does not make safe.
+        Selects only runs that are `running` and either unowned or held under
+        a lapsed lease, so a pass never takes a run away from a worker that is
+        still on it. Cancelled runs are not unfinished work and are left
+        alone; `failed` is not selected either, because it is a request for a
+        human and the automatic path has already had its turn (§4.14).
+
+        A run another worker claims first is skipped rather than fought over.
+
+        Two things make a pass safe to run unattended (CH9):
+
+        **Isolation.** Every run is executed inside its own `try`, so one that
+        cannot be deployed fails by itself. A bare loop ends on the first raise
+        and abandons everything behind it -- the operator's "a stuck run seems
+        to take the whole queue down with it".
+
+        **A bound.** Isolation alone would retry a hopeless run on every sweep
+        forever, which is the same head-of-line stall arriving as a spin. A run
+        gets `MAX_ATTEMPTS` executions; the claim counts them, and the one that
+        reaches the bound ends `failed` rather than staying in the pool. From
+        there only an operator's `retry` reopens it, which is why `failed` is
+        not selected below (§4.14).
         """
+        now = time.time()
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id FROM deployments WHERE status = 'running'"
+                """
+                SELECT id, attempt FROM deployments
+                WHERE status = 'running'
+                  AND cancel_requested = 0
+                  AND (
+                        owner IS NULL
+                     OR lease_expires_at IS NULL
+                     OR lease_expires_at <= ?
+                  )
+                """,
+                (now,),
             ).fetchall()
+
         for row in rows:
-            self.run_once(str(row["id"]))
+            run_id = str(row["id"])
+            attempts_so_far = int(row["attempt"] or 0)
+            if attempts_so_far >= MAX_ATTEMPTS:
+                # Its attempts were spent by workers that never came back, so
+                # nothing here ever saw the failure. The bound still holds.
+                self._fail(
+                    run_id,
+                    f"{attempts_so_far} automatic attempts were made and none"
+                    " completed",
+                )
+                continue
+            try:
+                self.run_once(run_id)
+            except (RunNotOwned, RunCancelled):
+                # Someone else's run, or one an operator stopped. Neither is a
+                # failure of this pass.
+                continue
+            except Exception as error:  # noqa: BLE001 - isolation is the point
+                if attempts_so_far + 1 >= MAX_ATTEMPTS:
+                    self._fail(run_id, f"{type(error).__name__}: {error}")

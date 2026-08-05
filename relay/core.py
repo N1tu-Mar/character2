@@ -4,8 +4,25 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+COMPLETE = "complete"
+DIVERGENT = "divergent"
+UNKNOWN = "unknown"
+
+# The fields that identify a deployed object and record where it came from
+# (ROADMAP §4.4, §4.5). These are the fields we sent and the provider echoed;
+# matching them proves presence and provenance, never content.
+IDENTITY_FIELDS = (
+    "external_key",
+    "source_asset_id",
+    "source_sha256",
+    "object_type",
+    "display_name",
+    "status",
+)
 
 
 class InjectedCrash(RuntimeError):
@@ -22,6 +39,15 @@ class RunCancelled(RuntimeError):
 
 class InvalidApprovedRequest(ValueError):
     """An approved request that cannot name a deployment or its objects."""
+
+
+class ProviderUnreadable(RuntimeError):
+    """The provider's state could not be opened or parsed at all.
+
+    Raised only for "we could not look". An object that is absent from a state
+    file that parsed fine is a successful read with a negative answer, and is
+    never routed through here (ROADMAP §4, Missing is not unreadable).
+    """
 
 
 def _canonical_json(value: Any) -> str:
@@ -272,6 +298,170 @@ class Relay:
             )
         return run_id
 
+    # -- certification --------------------------------------------------------
+    #
+    # One path, used by everything that reports on a deployment: the completion
+    # check inside `run_once`, `audit`, and `deployment_summary`. Every caller
+    # gets its answer from a reading of the provider taken now. Nothing here
+    # consults `receipt_json`, and no verdict is ever stored as truth.
+
+    def _normalized_display_name(self, value: Any) -> str:
+        """The provider's own rule for what it keeps, restated in one place.
+
+        Comparing against the raw approved string would invent a discrepancy
+        for every name the provider legitimately truncates. The limit is read
+        off the provider rather than written down, so this tracks the rule
+        instead of a copy of today's value.
+        """
+        limit = getattr(
+            self.provider,
+            "DISPLAY_NAME_LIMIT",
+            FakeHubSpot.DISPLAY_NAME_LIMIT,
+        )
+        return str(value).strip()[:limit]
+
+    def _expected_objects(
+        self,
+        idempotency_key: str,
+        payload: dict[str, Any],
+    ) -> dict[str, dict[str, str]]:
+        """What the provider must be holding for this approval, per §4.4-4.5."""
+        expected: dict[str, dict[str, str]] = {}
+        for asset in payload.get("assets", []):
+            key = external_key(idempotency_key, str(asset["asset_id"]))
+            expected[key] = {
+                "external_key": key,
+                "source_asset_id": str(asset["asset_id"]),
+                "source_sha256": str(asset["source_sha256"]),
+                "object_type": str(asset["type"]),
+                "display_name": self._normalized_display_name(
+                    asset["display_name"]
+                ),
+                "status": "draft",
+            }
+        return expected
+
+    def _list_provider_objects(self) -> list[dict[str, str]]:
+        try:
+            return list(self.provider.list_objects())
+        except (json.JSONDecodeError, OSError) as error:
+            raise ProviderUnreadable(str(error)) from error
+
+    def _read_provider_object(self, key: str) -> dict[str, str] | None:
+        """Read one object. `None` means we looked and it is not there.
+
+        The two failure modes are caught in separate clauses on purpose. A
+        `KeyError` is a successful read with a negative answer and must reach
+        the caller as a missing object; a state that cannot be parsed or
+        opened is "we could not look" and must not be reported as data loss
+        (ROADMAP §4, CH5b).
+        """
+        try:
+            return dict(self.provider.read(key))
+        except KeyError:
+            return None
+        except (json.JSONDecodeError, OSError) as error:
+            raise ProviderUnreadable(str(error)) from error
+
+    def _verdict(
+        self,
+        run_id: str,
+        certification: str,
+        discrepancies: list[dict[str, Any]],
+        objects_found: int,
+        objects_expected: int,
+    ) -> dict[str, Any]:
+        return {
+            "run_id": run_id,
+            "certification": certification,
+            "certified_at": datetime.now(timezone.utc).isoformat(),
+            "discrepancies": discrepancies,
+            "objects_found": objects_found,
+            "objects_expected": objects_expected,
+        }
+
+    def _certify(
+        self,
+        run: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        """Read the provider now and say what it holds for this deployment.
+
+        Returns the verdict and the objects actually found, so a caller that
+        needs to record what it saw does not have to read the provider twice.
+        """
+        run_id = str(run["id"])
+        idempotency_key = str(run["idempotency_key"])
+        expected = self._expected_objects(idempotency_key, run["payload"])
+        namespace = deployment_namespace(idempotency_key)
+        discrepancies: list[dict[str, Any]] = []
+        found: list[dict[str, str]] = []
+
+        try:
+            listed = self._list_provider_objects()
+            for key, want in expected.items():
+                stored = self._read_provider_object(key)
+                if stored is None:
+                    discrepancies.append(
+                        {
+                            "kind": "missing_object",
+                            "external_key": key,
+                            "source_asset_id": want["source_asset_id"],
+                        }
+                    )
+                    continue
+                found.append(stored)
+                for field in IDENTITY_FIELDS:
+                    if str(stored.get(field)) != want[field]:
+                        discrepancies.append(
+                            {
+                                "kind": "field_mismatch",
+                                "external_key": key,
+                                "source_asset_id": want["source_asset_id"],
+                                "field": field,
+                                "expected": want[field],
+                                "found": stored.get(field),
+                            }
+                        )
+        except ProviderUnreadable as error:
+            # No per-object claim is possible in either direction.
+            return (
+                self._verdict(
+                    run_id,
+                    UNKNOWN,
+                    [{"kind": "provider_unreadable", "detail": str(error)}],
+                    0,
+                    len(expected),
+                ),
+                [],
+            )
+
+        # The reverse scan (§4.3): anything under this deployment's namespace
+        # that nobody approved. Iterating the approved assets alone would never
+        # see a stray object.
+        for stored in listed:
+            key = str(stored.get("external_key", ""))
+            if key.startswith(namespace) and key not in expected:
+                discrepancies.append(
+                    {"kind": "unexpected_object", "external_key": key}
+                )
+
+        certification = COMPLETE if not discrepancies else DIVERGENT
+        return (
+            self._verdict(
+                run_id,
+                certification,
+                discrepancies,
+                len(found),
+                len(expected),
+            ),
+            found,
+        )
+
+    def certify(self, run_id: str) -> dict[str, Any]:
+        """The certification on its own, computed from a fresh readback."""
+        verdict, _found = self._certify(self.get(run_id))
+        return verdict
+
     def run_once(
         self,
         run_id: str,
@@ -285,7 +475,6 @@ class Relay:
                 (run_id,),
             )
 
-        readbacks: list[dict[str, str]] = []
         idempotency_key = str(run["idempotency_key"])
         for index, asset in enumerate(run["payload"]["assets"]):
             object_key = external_key(idempotency_key, str(asset["asset_id"]))
@@ -297,22 +486,26 @@ class Relay:
                 raise InjectedCrash(
                     "crashed after provider write and before local receipt"
                 )
-            readbacks.append(self.provider.read(object_key))
 
+        # `done` is earned, not assumed (ROADMAP §4.8). The run has finished
+        # every write it was asked to make; whether it may say so depends on
+        # what the provider holds when it is read now, after the last write.
+        verdict, objects = self._certify(run)
+        status = "done" if verdict["certification"] == COMPLETE else "failed"
         receipt = {
             "run_id": run_id,
             "payload_sha256": run["payload_hash"],
-            "objects": readbacks,
-            "verified": True,
+            "objects": objects,
+            "certification_at_completion": verdict,
         }
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE deployments
-                SET status = 'done', receipt_json = ?
+                SET status = ?, receipt_json = ?
                 WHERE id = ?
                 """,
-                (_canonical_json(receipt), run_id),
+                (status, _canonical_json(receipt), run_id),
             )
         return receipt
 
@@ -321,32 +514,49 @@ class Relay:
 
         This is what the dashboard and `make demo` show, and it is the
         quickest way to see the outcome of a run.
+
+        `status` is history: it says what the run did and does not change when
+        HubSpot does. The certification beside it is taken now, from the
+        provider, every single time this is called. Neither is reported
+        without the other (ROADMAP §4.9).
         """
         run = self.get(run_id)
-        receipt = run.get("receipt") or {}
-        objects = receipt.get("objects") or []
+        verdict, _found = self._certify(run)
         return {
             "run_id": run_id,
             "status": run["status"],
-            "objects_deployed": len(objects),
-            "verified": bool(receipt.get("verified")),
+            "objects_deployed": verdict["objects_found"],
             "assets_approved": len(run["payload"].get("assets", [])),
+            "certification": verdict["certification"],
+            "certified_at": verdict["certified_at"],
+            "discrepancies": verdict["discrepancies"],
         }
 
     def audit(self, run_id: str) -> dict[str, Any]:
         """The dashboard's "Check again" button.
 
-        Operators press this when they want reassurance that a deployment is
-        still in the state the receipt describes.
+        Operators press this when they want to know whether HubSpot still
+        holds what was approved. It answers by reading HubSpot -- never by
+        re-reading the receipt this service wrote about itself.
         """
         run = self.get(run_id)
-        receipt = run.get("receipt") or {}
-        objects = receipt.get("objects") or []
+        verdict, _found = self._certify(run)
+        missing = [
+            item
+            for item in verdict["discrepancies"]
+            if item.get("kind") == "missing_object"
+        ]
         return {
             "run_id": run_id,
-            "checked_objects": len(objects),
-            "all_present": all(obj.get("object_id") for obj in objects),
-            "verified": bool(receipt.get("verified")),
+            "status": run["status"],
+            "checked_objects": verdict["objects_expected"],
+            "objects_found": verdict["objects_found"],
+            "all_present": (
+                verdict["certification"] != UNKNOWN and not missing
+            ),
+            "certification": verdict["certification"],
+            "certified_at": verdict["certified_at"],
+            "discrepancies": verdict["discrepancies"],
         }
 
     def recover(self) -> None:

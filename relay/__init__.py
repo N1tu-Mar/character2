@@ -1,8 +1,12 @@
 from .core import (
+    COMPLETE,
+    DIVERGENT,
+    UNKNOWN,
     FakeHubSpot,
     IdempotencyConflict,
     InjectedCrash,
     InvalidApprovedRequest,
+    ProviderUnreadable,
     Relay,
     RunCancelled,
     deployment_namespace,
@@ -10,10 +14,14 @@ from .core import (
 )
 
 __all__ = [
+    "COMPLETE",
+    "DIVERGENT",
+    "UNKNOWN",
     "FakeHubSpot",
     "IdempotencyConflict",
     "InjectedCrash",
     "InvalidApprovedRequest",
+    "ProviderUnreadable",
     "Relay",
     "RunCancelled",
     "deployment_namespace",

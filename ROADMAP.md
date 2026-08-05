@@ -274,6 +274,14 @@ read at all, so no per-object claim is possible.
     - The re-read is mandatory. Deciding from the payload we were handed rather than from the row that actually landed reintroduces the race one layer up.
 
     This is the same shape as CH4's claim: a conditional write whose outcome is read back from the database, never inferred. Both the sequential path and the racing path must reach the identical verdict, so the acceptance suite exercises both.
+14. **`failed` is terminal for automatic recovery, and only an operator retry reopens it.** `recover()` picks up runs that are `running` with an expired lease. It does **not** pick up `failed`. A `failed` run stays `failed` until `retry` explicitly resets it to `pending` and clears its lease (CH11). Two reasons:
+
+    - **The loop has to terminate.** CH9 bounds attempts precisely so a run that cannot succeed stops consuming the recovery pass. If `recover()` also reclaimed `failed`, the bound would do nothing — the run would re-enter the pool on the next sweep and the head-of-line problem from c9 would come back as a slow spin instead of a hard stop.
+    - **`failed` is a request for a human.** A run reaches it by finishing its writes and failing to certify `complete` (rule 8), or by exhausting attempts. Both mean the automatic path has already tried and produced a wrong or unprovable result. Retrying that without someone looking is how a system talks itself into a false success.
+
+    The cost is real and worth stating: a run that failed only because of a transient torn read (F8) needs an operator to press retry, even though a second attempt would likely have certified `complete`. We accept a stalled run over an unattended retry loop, because the failure this project exists to remove is the service claiming more than it checked. An operator who reads `failed` and retries gets the right answer; a service that quietly retries until something says `complete` is the starter's behavior with more steps.
+
+    Because retry resets to `pending` rather than inserting a row, and because the provider key no longer contains `run_id` (CH1), that retry lands on the same HubSpot objects and creates no duplicates. This is the `failed` path and c4's operator retry converging on one mechanism.
 
 ### Identity: what names a HubSpot object
 
@@ -355,9 +363,9 @@ Change ids are `CH*` so they cannot be confused with the event-log case ids
 | CH6 | Split workflow status from certification (§4). `status` keeps `pending`/`running`/`done`/`cancelled`/`failed` and is historical; certification is recomputed on demand and never stored as truth. A run ends `done` only if it certified `complete` at completion; otherwise `failed`. | **ROOT CAUSE FIX** | G1, and the operator's "I have no way to know what this service promises" |
 | CH7 | `audit` re-reads the provider and recomputes certification, returning it alongside the historical status and the time of the check. `deployment_summary` likewise never presents status alone. | **FALSE-PASS PREVENTION** | G1, §4.9 |
 | CH8 | `cancel` sets `cancel_requested`; `run_once` checks it before every provider write and raises `RunCancelled`; the terminal status update becomes conditional on ownership and non-cancellation. | **ROOT CAUSE FIX** | G5 (c6) |
-| CH9 | Per-run `try/except` in `recover`, plus a bounded `attempt` count so a permanently failing run ends `failed` and is surfaced rather than retried forever. | **ROOT CAUSE FIX** | G6 (c9) |
+| CH9 | Per-run `try/except` in `recover`, plus a bounded `attempt` count so a permanently failing run ends `failed` and is surfaced rather than retried forever. `recover` selects `running` runs with expired leases and never `failed` ones (§4.14). | **ROOT CAUSE FIX** | G6 (c9) |
 | CH10 | Wrap `create_draft` in a reconcile helper **outside** the provider: on exception, read back the expected key; matching → success, absent → bounded retry, present-but-different → fail loudly. | **ROOT CAUSE FIX** | G7 (c10) |
-| CH11 | `retry` resets the existing run to `pending` and clears its lease instead of inserting a second row (which CH2's constraint would forbid anyway). | **ROOT CAUSE FIX** | G2 (c4) |
+| CH11 | `retry` resets the existing run to `pending` and clears its lease instead of inserting a second row (which CH2's constraint would forbid anyway). It is the only path out of `failed` (§4.14), and it resets the attempt count so CH9's bound applies to the new operator-authorized attempt rather than the exhausted one. | **ROOT CAUSE FIX** | G2 (c4) |
 | CH12 | SQLite `timeout` and WAL on `_connect`, so contention blocks briefly instead of raising `database is locked`. Coordination around storage, no behavior change. | **OBSERVABILITY ONLY** | F9 |
 | CH13 | The provider's lost-write and torn-read race (F8). **Not fixed.** It is an artifact of the fake (I1), TASK.md says the provider is not ours to change, and CH5 makes it visible instead of silent — as `divergent` when a write was lost, `unknown` when the state file cannot be parsed. | **OUT OF SCOPE** | F8 |
 | CH14 | c11 `thumbnail_render`. Not in the deployment path, not in the repository. | **OUT OF SCOPE** | c11 |
@@ -424,6 +432,8 @@ Rules for every test below:
 | Two workers cannot both claim the same pending run | full | no claim exists (F7) |
 | Concurrent different runs do not lose provider objects **or**, where the provider does lose them, no run certifies `complete` | full, N threads | 48 created / 36–44 held, all report done (F9) |
 | One broken recovery candidate does not stop later good runs | full + a deliberately broken run | bare loop (F15) |
+| **`recover()` does not reclaim a `failed` run** — drive a run to `failed`, then run repeated recovery passes and assert its status, attempt count, and the provider object count are all unchanged | full, via a wrapper that drops one write | `recover` selects on `status = 'running'` only, so `failed` does not exist yet (F15) |
+| **`retry` is the only path out of `failed`** — after the retry the run is `pending` with a cleared lease and a reset attempt count, the next pass deploys it, and it certifies `complete` **without adding provider objects** | full, wrapper removed before the retry | `retry` inserts a second row and doubles the drafts (F5) |
 | Ambiguous write exception followed by a matching readback is reconciled as success | full, via a wrapper that writes then raises | no `try/except` around `create_draft` (G7) |
 | Empty approved request is refused at submit and never yields a certification | empty | returns `verified: true` on zero objects (F12) |
 
@@ -467,6 +477,8 @@ mutation before applying the next.
 | M16 | Build the certification from the dicts `create_draft` returned, rather than from a fresh readback taken after every write completes. | A run whose object was erased by a concurrent writer still certifies `complete` — this is the exact c8 mechanism. |
 | M17 | In certification, iterate approved assets only; drop the reverse scan for provider objects under this deployment's key namespace. | A stray object goes unnoticed and the run still certifies `complete`. |
 | M18 | Remove the per-run `try/except` in `recover` so the first exception escapes the loop. | Runs queued behind a broken recovery candidate stay undeployed. |
+| M18b | Widen `recover`'s selection to `status IN ('running', 'failed')`. | The no-reclaim check fails — a `failed` run is picked up unattended, its attempt count climbs across passes, and CH9's bound stops bounding anything. |
+| M18c | Have `retry` leave the attempt count at its exhausted value instead of resetting it. | The retry check fails — the operator-authorized attempt is refused immediately by CH9's bound, so `failed` becomes permanent and nothing reopens it. |
 | M19 | Delete the reconcile wrapper; call `provider.create_draft` directly and let exceptions propagate. | A write that raises after persisting, followed by a matching readback, kills the run instead of being reconciled as success. |
 | M20 | Remove the zero-asset guard from `submit`. | An empty approved request gets a run id and a `complete` certification over zero objects. |
 
@@ -496,6 +508,14 @@ but **no run may certify `complete` while its objects are missing**, runs that
 cannot certify must end `failed` rather than `done`, and reads that fail against
 a half-written state file must certify `unknown` rather than `divergent`. Same
 short count, honest verdict.
+
+Its recovery pass is now also a test of §4.14. Under CH13 the provider will
+legitimately lose writes, so some runs end `failed` — and because `recover()`
+does not reclaim them, the three passes at `stress.py:74-79` must converge: the
+status counts stop changing after the first pass and stay stopped. The starter's
+version flips all 12 runs to `done` regardless (F9). A run count that keeps
+moving across passes, or a `failed` count that drains without anyone pressing
+retry, means the no-reclaim rule did not hold.
 
 **`make test`** — the two starter tests stay on the full fixture (see §6), plus
 the new acceptance suite.
@@ -538,6 +558,7 @@ For `DECISIONS.md`:
 - **Certification is point-in-time and expires the instant it is returned.** HubSpot can change a second later. `complete` means "complete when we looked," and the timestamp is reported for exactly that reason. There is no watch, no subscription, and no continuous reconciliation.
 - The provider can still lose writes. We detect it and report `divergent`; we do not prevent it (CH13).
 - `unknown` is honest but not actionable on its own. A run stuck at `unknown` needs a human or a later successful read; nothing here resolves it automatically.
+- **`failed` needs a human even when a retry would have worked.** §4.14 makes `failed` terminal for automatic recovery, so a run that failed to a transient torn read (F8) sits there until an operator presses retry. There is no backoff, no scheduled re-attempt, and no distinction between "failed transiently" and "failed permanently" — we do not have a reliable way to tell them apart from one readback, and guessing wrong in the permissive direction is how a service retries its way into a false `complete`. A real system would classify the failure and re-attempt the transient class automatically; that is deliberately not built here.
 - There is still a window between a provider write and the local record. Recovery closes it by re-reading, not by making the two atomic.
 - Identity is only as stable as the operator's idempotency key. If a client regenerates its key for the same approval — c3's ambiguous shape — this design will deploy twice and consider both correct. That is the accepted cost of choosing the key as the unit of idempotency, and it is the case least covered by this roadmap.
 - Two drafts may share a display name in HubSpot and be hard for a person to tell apart. That is accepted deliberately (§4, Identity): the objects are distinct and correct, and a name-uniqueness rule would reject valid approvals. The mitigation is that `external_key`, `object_id`, and `source_asset_id` all remain distinct and are what the system reasons about.
